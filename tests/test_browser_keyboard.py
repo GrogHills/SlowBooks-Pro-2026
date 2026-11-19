@@ -20,8 +20,10 @@ bakery's books of tests/test_theme_contrast.py (2.22.0 gate, round 2):
   fires, on any platform (W-6), and over a form being filled in Alt+N, P,
   Q and H do nothing from any of its controls, as Back does; ⌘K finds
   like Ctrl+K; Ctrl+Alt (AltGr) is left alone.
-- #695: Ctrl+F (⌘F) finds in the desktop window and is the browser's own
-  find in a browser; the search box names its keys (aria-keyshortcuts).
+- #695: Ctrl+F (⌘F) opens Find on this screen in the desktop window and is
+  the browser's own find in a browser; the search box names its keys
+  (aria-keyshortcuts), Ctrl+K (⌘K) and /. The find bar itself is
+  tests/test_browser_find.py.
 - NEW-30: the toolbar's Back, enabled only while an app page is behind,
   with Alt+← (⌘[ on a Mac); a reload keeps it.
 - NEW-32: no dialog opens with focus on Void or Delete; a dialog whose
@@ -441,6 +443,7 @@ BLUR = "() => document.activeElement && document.activeElement.blur()"
 SEARCH_KEYS = (
     "() => document.getElementById('global-search').getAttribute('aria-keyshortcuts')"
 )
+FIND_OPEN = "() => !!window.FindBar && FindBar.isOpen()"
 
 
 def test_ctrl_f_finds_in_the_desktop_app_and_is_the_browsers_in_a_browser(
@@ -457,30 +460,35 @@ def test_ctrl_f_finds_in_the_desktop_app_and_is_the_browsers_in_a_browser(
         for mods in ({"ctrlKey": True}, {"metaKey": True}):
             assert page.evaluate(PRESS, ["f", "KeyF", mods]) is False
             assert page.evaluate("() => document.activeElement.id") != "global-search"
-        # the desktop window (pywebview): Ctrl+F and ⌘F find, as Ctrl+K does
+            assert page.evaluate(FIND_OPEN) is False
+        # the desktop window (pywebview): Ctrl+F and ⌘F open the find bar,
+        # and the search box keeps Ctrl+K and /
         page.evaluate(
             "() => { window.pywebview = { api: {} };"
             " window.dispatchEvent(new Event('pywebviewready')); }"
         )
         assert page.evaluate("() => App.inDesktopShell()") is True
-        assert page.evaluate(SEARCH_KEYS) == f"{mod}+K {mod}+F /"
+        assert page.evaluate(SEARCH_KEYS) == f"{mod}+K /"
         for mods in ({"ctrlKey": True}, {"metaKey": True}):
             page.evaluate(BLUR)
             assert page.evaluate(PRESS, ["f", "KeyF", mods]) is True
-            assert page.evaluate("() => document.activeElement.id") == "global-search"
+            assert page.evaluate(FIND_OPEN) is True
+            assert page.evaluate("() => document.activeElement.id") == "find-input"
+            page.evaluate("() => FindBar.close()")
         # Ctrl+Alt+F (AltGr) types a character and is left alone
         page.evaluate(BLUR)
         assert (
             page.evaluate(PRESS, ["f", "KeyF", {"ctrlKey": True, "altKey": True}])
             is False
         )
-        assert page.evaluate("() => document.activeElement.id") != "global-search"
-        # over an open dialog it does nothing but keep the window's own
+        assert page.evaluate(FIND_OPEN) is False
+        # over an open dialog it opens the find bar too, for the dialog
         page.evaluate("() => openModal('A dialog', '<p>Hello</p>')")
         page.wait_for_function(MODAL_SHOWN)
         assert page.evaluate(PRESS, ["f", "KeyF", {"ctrlKey": True}]) is True
+        assert page.evaluate(FIND_OPEN) is True
         assert page.evaluate("() => document.activeElement.id") != "global-search"
-        page.evaluate("() => closeModal()")
+        page.evaluate("() => { FindBar.close(); closeModal(); }")
     finally:
         page.close()
 
@@ -4590,6 +4598,54 @@ SKIP_IN_MODAL = "() => document.querySelector('#modal-body a.skip-link--inline')
 ACTIVE = """() => { const a = document.activeElement;
     return { tag: a.tagName.toLowerCase(), id: a.id, cls: a.className, inLines: !!a.closest('#inv-lines, #bill-lines, #je-lines'),
              ring: a.matches(':focus-visible') }; }"""
+
+
+def test_a_form_whose_scan_is_off_still_opens_on_its_first_field(
+    browser, company, books
+):
+    """Enter Bill, Expense and Sales Receipt open on Scan Receipt, their
+    first control, and the OCR status answers after that: on a computer
+    without Tesseract, wire() then disabled the focused button and focus
+    fell to the page, so the form opened with focus nowhere. The status is
+    held until the dialog has placed focus, as a slow answer does, and the
+    form must end on its first field, where it would have opened with Scan
+    already off."""
+    page, handled = _open(browser, company)
+    held = []
+    page.route("**/api/ocr/status", lambda route: held.append(route))
+    try:
+        for route, call, ready in (
+            ("#/bills", "BillsPage.showForm()", "#bill-lines tr"),
+            ("#/expenses", "ExpensesPage.showForm()", "#expense-lines tr"),
+            ("#/sales-receipts", "SalesReceiptsPage.showForm()", "#sr-lines tr"),
+        ):
+            _visit(page, handled, route)
+            page.evaluate("() => { ScanHelper._status = null; }")
+            held.clear()
+            page.evaluate(f"async () => {{ await {call}; }}")
+            page.wait_for_function(MODAL_SHOWN, timeout=5000)
+            page.wait_for_selector(ready)
+            page.wait_for_function(
+                "() => document.activeElement && document.activeElement.id === 'scan-btn'",
+                timeout=5000,
+            )
+            assert len(held) == 1, (route, len(held))
+            held[0].fulfill(
+                json={"available": False, "version": None, "languages": None}
+            )
+            page.wait_for_function(
+                "() => document.getElementById('scan-btn').disabled", timeout=5000
+            )
+            settle(page, handled)
+            at = page.evaluate(ACTIVE)
+            assert at["tag"] != "body" and at["id"] != "scan-btn", (route, at)
+            assert page.evaluate("() => document.activeElement === _modalLanding()"), (
+                route,
+                at,
+            )
+            page.evaluate("() => closeModal()")
+    finally:
+        page.close()
 
 
 def test_the_long_forms_skip_to_their_lines_and_the_chart_to_its_filter(
